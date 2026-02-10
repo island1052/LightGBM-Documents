@@ -1,0 +1,620 @@
+---
+title: "LightGBM for Classification"
+author: "Guanjinghui Xu"
+date: "2026-01-31"
+output: html_document
+---
+
+# LightGBM for Classification Manual Version
+
+## 1) 环境初始化
+
+```{r}
+# 0.1 读取当前位置，并将工作环境设置为当前位置，注意此处为相对位置}
+if (requireNamespace("rstudioapi", quietly = TRUE)) {
+  setwd(dirname(rstudioapi::getActiveDocumentContext()$path))
+}
+
+# 0.2 加载包与多核配置
+if (!require("pacman")) install.packages("pacman")
+pacman::p_load(
+  tidyverse, lightgbm, recipes, caret, ParBayesianOptimization, 
+  pROC, rmda, shapviz, DALEX, DALEXtra, parallel, doParallel,
+  ggraph, igraph, foreach, doParallel, tidymodels, Matrix
+)
+
+# 获取逻辑核心数，预留2个核心给系统
+n_cores <- max(1, parallel::detectCores() - 2)
+cat("使用核心数:", n_cores, "\n")
+
+# 0.3 自动创建文件夹结构
+dirs <- c("0Data", "1Models", "1.5Tables", "2Figs", "3Permutation", "4SHAP")
+sapply(dirs, function(d) if(!dir.exists(d)) dir.create(d, recursive = TRUE))
+```
+
+## 2) 数据准备
+
+### 本Manual Version 使用Titanic数据集，进行二分类（Binary Classification）任务，即预测乘客在沉船事故中是“幸存”还是“遇难”。
+
+### 以下为该数据集的说明
+
+|  |  |  |
+|------------------------|------------------------|------------------------|
+| **字段名** | **说明** | **备注** |
+| **PassengerId** | 乘客ID | 随机分配的序号，通常对预测无用。 |
+| **Pclass** | 客舱等级 | 1 = 一等舱（富人），2 = 二等舱，3 = 三等舱（穷人）。 |
+| **Name** | 姓名 | 包含头衔（Mr, Mrs, Miss），可用于特征工程。 |
+| **Sex** | 性别 | 关键特征（女性优先获救）。 |
+| **Age** | 年龄 | 有大量缺失值，需要处理。 |
+| **SibSp** | 堂兄弟/配偶人数 | 在船上的兄弟姐妹及配偶数量。 |
+| **Parch** | 父母/子女人数 | 在船上的父母及子女数量。 |
+| **Ticket** | 船票编号 | 格式杂乱，通常需要清洗或剔除。 |
+| **Fare** | 票价 | 与客舱等级正相关。 |
+| **Cabin** | 船舱号 | 缺失值极多（约77%）。 |
+| **Embarked** | 登船港口 | C=瑟堡, Q=皇后镇, S=南安普敦。 |
+
+```{r}
+# 载入 Titanic 数据二分类（Binary Classification）**任务，即预测乘客在沉船事故中是“幸存”还是“遇难”。
+if (!require("titanic")) install.packages("titanic")
+library(titanic)
+
+raw_df <- titanic::titanic_train %>%
+  select(Survived, Pclass, Sex, Age, SibSp, Parch, Fare, Embarked) %>%
+  mutate(
+    Survived = as.factor(Survived),
+    Pclass = as.factor(Pclass)
+  ) %>%
+  drop_na(Embarked)  # 删除Embarked的缺失值
+
+# 划分数据集
+set.seed(123)
+train_idx <- createDataPartition(raw_df$Survived, p = 0.8, list = FALSE)
+train_raw <- raw_df[train_idx, ]
+test_raw  <- raw_df[-train_idx, ]
+write_csv(train_raw, "0Data/train_raw.csv")
+write_csv(test_raw, "0Data/test_raw.csv")
+
+cat("数据划分完成：训练集", nrow(train_raw), "行，测试集", nrow(test_raw), "行\n")
+```
+
+## 3) 数据预处理与模型训练
+
+```{r}
+# 3.1 数据预处理
+# 使用recipes包进行数据预处理
+# Recipe 构建（BagImpute & Dummy）
+rec_obj <- recipe(Survived ~ ., data = train_raw) %>%
+  step_impute_bag(Age, impute_with = imp_vars(Pclass, Sex, SibSp, Parch, Fare)) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  prep()
+
+saveRDS(rec_obj, "1Models/recipe_model.rds") # 保存预处理模型
+# 数据分割后的训练集和测试集进行预处理
+train_data <- bake(rec_obj, new_data = train_raw)
+test_data  <- bake(rec_obj, new_data = test_raw)
+
+# 计算正负样本权重
+pos_count <- sum(train_data$Survived == "1") # 计算正样本数量
+neg_count <- sum(train_data$Survived == "0") # 计算负样本数量
+pos_w <- ifelse(pos_count > 0, neg_count / pos_count, 1)
+cat("正样本权重:", pos_w, "\n")
+
+# 构造适用于LightGBM的数据格式
+dtrain <- lgb.Dataset(
+  data = as.matrix(train_data %>% select(-Survived)),
+  label = as.numeric(train_data$Survived) - 1,
+  weight = ifelse(train_data$Survived == "1", pos_w, 1),
+  params = list(nthread = n_cores)
+)
+```
+
+## 4) 模型训练及调优
+
+### 训练LightGBM模型，并使用交叉验证（Cross-Validation）进行调优，优化指标为AUC。
+
+### 这里我们使用了传统的网格搜索和一个贝叶斯优化的示例，实际应用中可以根据需要选择其中一种方法。
+
+```{r}
+# 3.2.1 网格搜索（Grid Search）CPU多核并行化实现
+grid_params <- expand.grid(
+  learning_rate = c(0.01, 0.1 , 0.2),
+  num_leaves = c(31, 63 , 127),
+  max_depth = c(5, 10 , 15),
+  stringsAsFactors = FALSE
+)
+
+cat("开始网格搜索...\n")
+cl <- makeCluster(min(n_cores, nrow(grid_params))) # 创建并行集群，核心数不超过网格参数组合数
+registerDoParallel(cl)# 注册并行后端
+# 使用foreach进行并行计算，.combine = rbind表示将结果按行合并成一个数据框
+grid_results <- foreach(
+  i = 1:nrow(grid_params), # 遍历每一行参数组合
+  .combine = rbind, # 将每次迭代的结果按行合并成一个数据框
+  .packages = c("lightgbm", "dplyr", "magrittr"),# 指定每个工作线程需要加载的包
+  .export = c("dtrain")# 将dtrain对象导出到每个工作线程中
+) %dopar% {# 获取当前参数组合
+  
+  current_p <- as.list(grid_params[i, ])# 设置当前参数组合
+  
+  # 设置参数
+  params <- list(
+    objective = "binary",
+    metric = "auc",# 评估指标为AUC
+    learning_rate = current_p$learning_rate,# 学习率
+    num_leaves = as.integer(current_p$num_leaves),# 叶子数
+    max_depth = as.integer(current_p$max_depth),# 最大深度
+    nthread = 1# 每个线程只使用一个核心，避免在并行环境中出现过多线程竞争问题
+  )
+  
+  # 执行CV
+  cv_result <- tryCatch({
+    cv <- lgb.cv(
+      params = params,
+      data = dtrain,
+      nrounds = 50,# 最大迭代次数
+      nfold = 5,# 5折交叉验证
+      early_stopping_rounds = 5,
+      verbose = -1,# 关闭训练日志输出
+      showsd = TRUE# 显示标准差，便于评估模型稳定性
+    )
+    
+    # 提取最佳AUC
+    best_auc <- max(unlist(cv$record_evals$valid$auc$eval))
+    best_iter <- cv$best_iter
+    
+    data.frame(
+      learning_rate = current_p$learning_rate,
+      num_leaves = current_p$num_leaves,
+      max_depth = current_p$max_depth,
+      auc = best_auc,
+      best_iter = best_iter
+    )
+  }, error = function(e) {
+    data.frame(
+      learning_rate = current_p$learning_rate,
+      num_leaves = current_p$num_leaves,
+      max_depth = current_p$max_depth,
+      auc = NA,
+      best_iter = NA
+    )
+  })
+  
+  return(cv_result)
+}
+
+stopCluster(cl)
+registerDoSEQ()# 恢复顺序执行
+
+write_csv(grid_results, "1.5Tables/grid_search_log.csv")
+cat("网格搜索完成，最佳AUC:", max(grid_results$auc, na.rm = TRUE), "\n")
+
+# 3.2.2 贝叶斯优化（Bayesian Optimization）示例
+
+cat("开始贝叶斯优化...\n")
+
+bayes_func <- function(learning_rate, num_leaves, max_depth) {
+  params <- list(
+    objective = "binary",
+    metric = "auc",
+    learning_rate = learning_rate,
+    num_leaves = as.integer(num_leaves),# 叶子数需要转换为整数
+    max_depth = as.integer(max_depth),# 最大深度需要转换为整数
+    scale_pos_weight = pos_w,# 处理类别不平衡
+    nthread = n_cores,
+    verbose = -1# 关闭训练日志输出
+  )
+  
+  cv <- lgb.cv(
+    params = params,
+    data = dtrain,
+    nrounds = 100,
+    nfold = 5,
+    early_stopping_rounds = 10,
+    verbose = -1
+  )
+  
+  best_auc <- max(unlist(cv$record_evals$valid$auc$eval))
+  
+  return(list(
+    Score = best_auc,
+    nrounds = cv$best_iter
+  ))
+}
+
+# 设置边界
+bounds <- list(
+  learning_rate = c(0.01, 0.1),
+  num_leaves = c(10L, 100L),# 叶子数通常在10到100之间
+  max_depth = c(3L, 15L)
+)
+
+# 运行贝叶斯优化
+set.seed(123)
+opt_res <- bayesOpt(
+  FUN = bayes_func,
+  bounds = bounds,
+  initPoints = 10,
+  iters.n = 10,
+  acq = "ucb",
+  kappa = 2.576,
+  eps = 0.0,
+  verbose = 1
+)
+
+best_p <- getBestPars(opt_res)
+cat("贝叶斯优化最佳参数:\n")
+print(best_p)
+
+# 使用最佳参数训练最终模型
+final_params <- list(
+  objective = "binary",
+  metric = "auc",
+  learning_rate = best_p$learning_rate,
+  num_leaves = as.integer(best_p$num_leaves),
+  max_depth = as.integer(best_p$max_depth),
+  scale_pos_weight = pos_w,
+  nthread = n_cores,
+  verbose = 1
+)
+
+final_model <- lgb.train(
+  params = final_params,
+  data = dtrain,
+  nrounds = opt_res$scoreSummary$nrounds[which.max(opt_res$scoreSummary$Score)],
+  valids = list(train = dtrain),
+  early_stopping_rounds = 10
+)
+
+lgb.save(final_model, "1Models/final_lgbm.txt")
+saveRDS(final_model, "1Models/final_lgbm.rds")# 同时保存为文本和RDS格式，方便后续加载和使用
+cat("最终模型已保存\n")
+
+```
+
+## 5) 模型评估与解释
+
+### 准备绘图用数据表格
+
+```{r}
+# 4.0 输出模型的Feature Importance到csv文件
+importance_df <- lgb.importance(final_model, percentage = TRUE)# 提取特征重要性数据框
+write_csv(importance_df, "1.5Tables/feature_importance.csv")# 保存特征重要性表格
+# 4.1 模型评估
+# 预测测试集
+test_probs <- predict(final_model, as.matrix(test_data %>% select(-Survived)))# 预测概率
+# 保存预测结果到csv文件
+test_results <- test_data %>%
+  select(Survived) %>%
+  mutate(Predicted_Prob = test_probs)
+write_csv(test_results, "1.5Tables/test_predictions.csv")# 保存预测结果表格
+# 计算ROC和最佳阈值
+roc_obj <- roc(as.numeric(test_data$Survived) - 1, test_probs)# 计算ROC对象
+best_thr <- coords(roc_obj, "best", ret = "threshold", best.method = "youden")$threshold # 计算最佳阈值
+cat("最佳阈值:", best_thr, "\n")
+
+# 保存性能指标
+performance_df <- data.frame(
+  AUC = auc(roc_obj),
+  Threshold = best_thr,
+  Sensitivity = coords(roc_obj, best_thr, ret = "sensitivity")$sensitivity,
+  Specificity = coords(roc_obj, best_thr, ret = "specificity")$specificity
+)
+write_csv(performance_df, "1.5Tables/test_metrics.csv")# 保存性能指标表格
+
+# 4.2 计算混淆矩阵
+test_preds_class <- ifelse(test_probs > best_thr, 1, 0)# 根据最佳阈值将概率转换为二分类预测
+conf_matrix_obj <- confusionMatrix(
+  data = factor(test_preds_class, levels = c(0, 1)),
+  reference = factor(as.numeric(test_data$Survived) - 1, levels = c(0, 1)),
+  positive = "1"
+)
+
+# 保存混淆矩阵结果
+conf_df <- as.data.frame.matrix(conf_matrix_obj$table)
+conf_metrics <- data.frame(
+  Metric = names(conf_matrix_obj$byClass),
+  Value = as.numeric(conf_matrix_obj$byClass)
+)
+write_csv(conf_df, "1.5Tables/confusion_matrix_raw.csv")
+write_csv(conf_metrics, "1.5Tables/confusion_matrix_metrics.csv")
+
+# 4.3 先保存绘制DCA曲线所需的数据表格
+dca_df <- data.frame(
+  y = as.numeric(test_data$Survived) - 1,
+  prob = test_probs
+)
+write_csv(dca_df, "1.5Tables/dca_data.csv")
+```
+
+### 集中绘图模块
+
+```{r}
+#绘制特征重要性图
+importance_df <- read_csv("1.5Tables/feature_importance.csv", show_col_types = FALSE)
+p_imp <- ggplot(importance_df, aes(x = reorder(Feature, Gain), y = Gain)) +
+  geom_bar(stat = "identity", fill = "#377EB8") +
+  coord_flip() +
+  theme_minimal(base_size = 14) +
+  labs(title = "Feature Importance (Gain)", x = "Feature", y = "Importance (%)") +
+  theme(
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor.y = element_blank(),
+    plot.title = element_text(hjust = 0.5, size = 16, face = "bold")
+  )
+ggsave("2Figs/Feature_Importance_300DPI.png", p_imp, width = 7, height = 6, dpi = 300)
+
+# 绘制ROC曲线
+png("2Figs/ROC_300DPI.png", width = 1800, height = 1800, res = 300)
+test_results <- readr::read_csv("1.5Tables/test_predictions.csv", show_col_types = FALSE)
+roc_obj <- pROC::roc(as.numeric(test_results$Survived) - 1, test_results$Predicted_Prob)
+plot(roc_obj, col = "#E41A1C", lwd = 3, main = "ROC Curve")
+abline(h = seq(0, 1, 0.1), v = seq(0, 1, 0.1), col = "gray", lty = 3)
+legend("bottomright", legend = paste("AUC =", round(pROC::auc(roc_obj), 3)), 
+       col = "#E41A1C", lwd = 3)
+grid()
+dev.off()
+# 绘制混淆矩阵热图
+test_results <- readr::read_csv("1.5Tables/test_predictions.csv", show_col_types = FALSE)
+perf <- readr::read_csv("1.5Tables/test_metrics.csv", show_col_types = FALSE)
+best_thr <- perf$Threshold[1]
+
+# 根据保存的阈值重建混淆矩阵数据
+preds_class <- ifelse(test_results$Predicted_Prob > best_thr, 1, 0)
+conf_melt <- as.data.frame(table(Reference = test_results$Survived, Prediction = preds_class))
+conf_melt$Reference <- factor(conf_melt$Reference, levels = c(1, 0))
+conf_melt$Prediction <- factor(conf_melt$Prediction, levels = c(1, 0))
+
+p_cm <- ggplot(conf_melt, aes(x = Reference, y = Prediction, fill = Freq)) +
+  geom_tile(color = "white", linewidth = 1) +
+  geom_text(aes(label = Freq), size = 8, fontface = "bold",
+            color = ifelse(conf_melt$Freq > max(conf_melt$Freq) / 2, "white", "black")) +
+  scale_fill_gradient(low = "#e0f3f8", high = "#2c7bb6") +
+  scale_x_discrete(labels = c("1" = "Survived", "0" = "Not Survived")) +
+  scale_y_discrete(labels = c("1" = "Pred Survived", "0" = "Pred Not Survived")) +
+  theme_minimal(base_size = 14) +
+  theme(
+    panel.grid = element_blank(),
+    axis.text = element_text(face = "bold"),
+    plot.title = element_text(hjust = 0.5, size = 16, face = "bold")
+  ) +
+  labs(title = paste("Confusion Matrix (Threshold =", round(best_thr, 3), ")"),
+       x = "Actual", y = "Predicted", fill = "Count")
+
+ggsave("2Figs/Confusion_Matrix_300DPI.png", p_cm, width = 7, height = 6, dpi = 300)
+# 绘制DCA
+dca_data <- rmda::decision_curve(
+  y ~ prob,
+  data = dca_df,
+  study.design = "cohort",
+  confidence.intervals = "none"
+)
+
+png("2Figs/DCA_300DPI.png", width = 1800, height = 1800, res = 300)
+rmda::plot_decision_curve(
+  dca_data,
+  curve.names = "LightGBM Model",
+  cost.benefit.axis = FALSE,
+  standardize = FALSE,
+  confidence.intervals = FALSE,
+  lwd = 2
+)
+dev.off()
+```
+
+## 6) Permutation
+
+```{r}
+cat("开始Permutation分析...\n")
+#-------------------------------- 1. 计算与保存模块 --------------------------------
+library(DALEX)
+library(dplyr)
+library(readr)
+
+# A. 特征重要性计算 (Feature Importance)
+p_func <- function(model, newdata) {
+  predict(model, as.matrix(newdata))
+}
+
+explainer <- explain(
+  model = final_model,
+  data = test_data %>% select(-Survived),
+  y = as.numeric(test_data$Survived) - 1,
+  predict_function = p_func,
+  label = "LightGBM",
+  verbose = FALSE
+)
+
+perm_res <- model_parts(
+  explainer,
+  B = 500, 
+  type = "variable_importance",
+  loss_function = loss_one_minus_auc
+)
+
+# 保存特征重要性原始数据 (注意：DALEX的对象建议存为RDS以保留类信息)
+saveRDS(perm_res, "1.5Tables/permutation_importance_obj.rds")
+write_csv(as.data.frame(perm_res), "1.5Tables/permutation_distribution_data.csv")
+
+
+# B. 置换检验计算 (Permutation Test for Accuracy)
+observed_acc <- as.numeric(conf_matrix_obj$overall["Accuracy"])
+preds_class_obs <- ifelse(test_probs > best_thr, 1, 0)
+
+B_perm <- 1000
+set.seed(2026)
+
+perm_acc <- vapply(seq_len(B_perm), function(i) {
+  perm_y <- sample(as.numeric(test_data$Survived) - 1)
+  mean(preds_class_obs == perm_y)
+}, numeric(1))
+
+# 计算 p-value 并存入一个小表
+p_value <- mean(perm_acc >= observed_acc)
+stats_summary <- data.frame(
+  metric = c("observed_acc", "p_value"),
+  value = c(observed_acc, p_value)
+)
+
+# 统一保存计算结果
+write_csv(data.frame(perm_accuracy = perm_acc), "3Permutation/perm_accuracy_distribution.csv")
+write_csv(stats_summary, "3Permutation/perm_test_stats.csv")
+
+#-------------------------------- 2. 绘图模块 --------------------------------
+library(ggplot2)
+library(readr)
+library(DALEX) # 绘图DALEX对象需要加载包
+
+# A. 绘制特征重要性图
+# 读取 RDS 以保持 DALEX 的 plot 兼容性
+perm_res_obj <- readRDS("1.5Tables/permutation_importance_obj.rds")
+
+p_perm <- plot(perm_res_obj) +
+  theme_minimal() +
+  theme(
+    axis.text = element_text(size = 10),
+    axis.title = element_text(size = 12, face = "bold"),
+    plot.title = element_text(size = 14, face = "bold", hjust = 0.5)
+  ) +
+  labs(title = "Permutation Feature Importance")
+
+ggsave("3Permutation/Permutation_Importance.png", p_perm, width = 10, height = 6, dpi = 300)
+
+
+# B. 绘制置换检验直方图
+perm_acc_df <- read_csv("3Permutation/perm_accuracy_distribution.csv", show_col_types = FALSE)
+stats_summary <- read_csv("3Permutation/perm_test_stats.csv", show_col_types = FALSE)
+
+# 从摘要表中提取数值用于标注
+obs_acc <- stats_summary$value[stats_summary$metric == "observed_acc"]
+p_val <- stats_summary$value[stats_summary$metric == "p_value"]
+
+p_perm_hist <- ggplot(perm_acc_df, aes(x = perm_accuracy)) +
+  geom_histogram(aes(y = ..density..), bins = 30, fill = "grey90", color = "black") +
+  geom_density(alpha = 0.25, fill = "grey60", color = "black", size = 0.8) +
+  geom_vline(xintercept = obs_acc, color = "red", linetype = "dashed", size = 1.2) +
+  annotate("text", x = obs_acc, y = 2, # y值可根据实际density调整
+           label = paste0("Real Accuracy: ", sprintf("%.3f", obs_acc), "\n",
+                          "p-value: ", sprintf("%.4f", p_val)),
+           hjust = 1.1, color = "red", fontface = "bold", size = 5) +
+  labs(x = "Model Accuracy", y = "Density", 
+       title = "Permutation test: Accuracy distribution") +
+  theme_minimal(base_size = 14) +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+
+ggsave("3Permutation/Permutation_Accuracy_Histogram.png", p_perm_hist, width = 10, height = 6, dpi = 300)
+```
+
+## 7) SHAP
+
+```{r}
+cat("开始SHAP分析...\n")
+
+# 确保test_X_mat已定义
+test_X_mat <- as.matrix(test_data %>% select(-Survived))
+
+# 获取SHAP值
+shap_values <- predict(final_model, test_X_mat, type = "contrib")
+
+# 处理SHAP值矩阵
+X_df <- as.data.frame(test_X_mat)
+if (ncol(shap_values) == ncol(X_df) + 1) {
+  colnames(shap_values) <- c(colnames(X_df), "BIAS")
+  X_df$BIAS <- 0
+} else {
+  colnames(shap_values) <- colnames(X_df)
+}
+
+# 将 SHAP 值与特征值保存为 CSV（绘图模块以后直接读取这些 CSV）
+shap_mat_df <- as.data.frame(shap_values[, colnames(X_df), drop = FALSE])
+shap_mat_df <- shap_mat_df %>% mutate(row_id = row_number())
+shap_long_df <- shap_mat_df %>%
+  pivot_longer(cols = -row_id, names_to = "variable", values_to = "shap_value")
+
+feature_mat_df <- X_df %>% mutate(row_id = row_number())
+feature_long_df <- feature_mat_df %>%
+  pivot_longer(cols = -row_id, names_to = "variable", values_to = "feature_value")
+
+shap_combined_long <- left_join(shap_long_df, feature_long_df, by = c("row_id", "variable"))
+
+# 保存文件（用于后续独立绘图模块读取）
+readr::write_csv(shap_combined_long, "4SHAP/shap_values_long.csv")
+readr::write_csv(X_df %>% mutate(row_id = row_number()), "4SHAP/shap_X.csv")
+readr::write_csv(shap_mat_df, "4SHAP/shap_values_wide.csv")
+
+# ---- 绘图模块（从 CSV 读取） ----
+shap_long <- readr::read_csv("4SHAP/shap_values_long.csv", show_col_types = FALSE)
+
+# 1) 全局重要性：小提琴图（按每个特征的平均绝对 SHAP 值排序）
+feat_order <- shap_long %>%
+  group_by(variable) %>%
+  summarise(mean_abs_shap = mean(abs(shap_value), na.rm = TRUE)) %>%
+  arrange(mean_abs_shap) %>%
+  pull(variable)
+
+shap_long <- shap_long %>%
+  mutate(variable = factor(variable, levels = feat_order))
+
+p_global <- ggplot(shap_long, aes(x = variable, y = abs(shap_value))) +
+  geom_violin(fill = "#377EB8", color = NA, scale = "width") +
+  coord_flip() +
+  theme_minimal(base_size = 14) +
+  labs(title = "SHAP Feature Importance (Violin of |SHAP|)",
+       x = "Feature", y = "|SHAP value|") +
+  theme(
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor.y = element_blank(),
+    plot.title = element_text(hjust = 0.5, size = 16, face = "bold")
+  )
+
+ggsave("4SHAP/SHAP_Global_Importance_Violin.png", p_global, width = 10, height = 6, dpi = 300)
+
+# 2) 依赖图（读取 CSV，绘制前3个重要特征）
+top_features <- tail(feat_order, 3) # 已按升序排列，取最后3个为top3
+
+for (f in top_features) {
+  df_f <- shap_long %>%
+    filter(variable == f) %>%
+    # 尝试把 feature_value 转为数值（若为因子/字符将保留原样）
+    mutate(feature_numeric = suppressWarnings(as.numeric(feature_value)))
+  
+  # 若 numeric 成功（非全 NA），使用数值 x，否则用原始字符串 x（jitter 以便可视化）
+  if (!all(is.na(df_f$feature_numeric))) {
+    p_dep <- ggplot(df_f, aes(x = feature_numeric, y = shap_value)) +
+      geom_point(alpha = 0.6, color = "#2C7BB6") +
+      theme_minimal() +
+      labs(title = paste("SHAP Dependence Plot:", f), x = f, y = "SHAP value")
+  } else {
+    p_dep <- ggplot(df_f, aes(x = feature_value, y = shap_value)) +
+      geom_jitter(width = 0.15, height = 0, alpha = 0.6, color = "#2C7BB6") +
+      theme_minimal() +
+      labs(title = paste("SHAP Dependence Plot (categorical):", f), x = f, y = "SHAP value")
+  }
+  
+  ggsave(paste0("4SHAP/SHAP_Dependence_", f, ".png"), p_dep, width = 8, height = 6, dpi = 300)
+}
+
+# 3) 瀑布图（近似实现：对每个样本绘制贡献最大的前10个特征的横向条形图）
+shap_wide <- readr::read_csv("4SHAP/shap_values_wide.csv", show_col_types = FALSE)
+
+for (i in 1:3) {
+  if (i <= nrow(shap_wide)) {
+    sample_row <- shap_wide %>% filter(row_id == i) %>% select(-row_id)
+    sample_long <- sample_row %>%
+      pivot_longer(everything(), names_to = "variable", values_to = "shap_value") %>%
+      mutate(abs_shap = abs(shap_value)) %>%
+      arrange(desc(abs_shap)) %>%
+      slice_head(n = 10) %>%
+      mutate(variable = factor(variable, levels = rev(variable)))
+    
+    p_waterfall <- ggplot(sample_long, aes(x = variable, y = shap_value, fill = shap_value > 0)) +
+      geom_col() +
+      coord_flip() +
+      scale_fill_manual(values = c("TRUE" = "#E41A1C", "FALSE" = "#377EB8"), guide = FALSE) +
+      theme_minimal(base_size = 12) +
+      labs(title = paste("SHAP Waterfall (Top 10 contributions) - Sample", i),
+           x = "Feature", y = "SHAP value")
+    
+    ggsave(paste0("4SHAP/SHAP_Waterfall_Sample", i, ".png"), p_waterfall, width = 10, height = 6, dpi = 300)
+  }
+}
+```
